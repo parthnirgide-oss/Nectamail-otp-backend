@@ -48,6 +48,19 @@ function hashOtp(otp, challengeId) {
   return crypto.createHash('sha256').update(`${challengeId}:${otp}`).digest('hex');
 }
 
+function verifyDeviceSignature(publicKeyB64, messageStr, signatureB64) {
+  try {
+    const pubKeyDer = Buffer.from(publicKeyB64, 'base64');
+    const keyObj = crypto.createPublicKey({ key: pubKeyDer, format: 'der', type: 'spki' });
+    const signedMessage = Buffer.from(messageStr, 'utf8');
+    const sigBuffer = Buffer.from(signatureB64, 'base64');
+    return crypto.verify('sha256', signedMessage, keyObj, sigBuffer);
+  } catch (err) {
+    console.error('Signature verification error:', err.message);
+    return false;
+  }
+}
+
 function requireInternalSecret(req, res, next) {
   const secret = req.headers['x-api-secret'];
   if (secret !== INTERNAL_API_SECRET) {
@@ -66,24 +79,53 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * 1. BIND DEVICE TO PHONE NUMBER (Phone-only account, no email stored)
+ * 1. BIND DEVICE TO PHONE NUMBER (Hardware Keystore Signature Locked)
  */
 app.post('/api/device/bind', async (req, res) => {
   try {
     const phoneNumber = normalizePhone(req.body.phoneNumber);
-    const { fcmToken, publicKey, deviceName } = req.body;
+    const { fcmToken, publicKey, deviceName, timestamp, signature } = req.body;
 
     if (!phoneNumber || phoneNumber.length < 10) {
       return res.status(400).json({ success: false, error: 'Valid SIM phone number required' });
+    }
+    if (!fcmToken || !publicKey || !timestamp || !signature) {
+      return res.status(400).json({
+        success: false,
+        error: 'Hardware signature, timestamp, publicKey, and fcmToken are required'
+      });
+    }
+
+    const tsNum = Number(timestamp);
+    if (!Number.isFinite(tsNum) || Math.abs(Date.now() - tsNum) > 5 * 60 * 1000) {
+      return res.status(401).json({ success: false, error: 'Expired or invalid timestamp' });
     }
 
     const deviceRef = db.collection('device_bindings').doc(phoneNumber);
     const existing = await deviceRef.get();
 
+    // If already bound, enforce the EXISTING hardware publicKey stored in Firestore
+    const trustedPublicKeyB64 = existing.exists && existing.data().publicKey
+      ? existing.data().publicKey
+      : publicKey;
+
+    const isValid = verifyDeviceSignature(
+      trustedPublicKeyB64,
+      `${phoneNumber}:${fcmToken}:${timestamp}`,
+      signature
+    );
+
+    if (!isValid) {
+      return res.status(403).json({
+        success: false,
+        error: 'Hardware Keystore signature mismatch. This number is locked to another physical device.'
+      });
+    }
+
     const payload = {
       phoneNumber,
-      fcmToken: fcmToken || null,
-      publicKey: publicKey || null,
+      fcmToken,
+      publicKey: trustedPublicKeyB64,
       deviceName: deviceName || 'Android Device',
       lastBoundIp: getClientIp(req),
       updatedAt: FieldValue.serverTimestamp()
@@ -97,7 +139,7 @@ app.post('/api/device/bind', async (req, res) => {
 
     res.json({
       success: true,
-      message: 'Phone number and device bound successfully',
+      message: 'Phone number and hardware Keystore bound successfully',
       phoneNumber
     });
   } catch (err) {
@@ -125,7 +167,7 @@ app.post('/api/otp/request', requireInternalSecret, async (req, res) => {
     if (!deviceSnap.exists) {
       return res.status(404).json({
         success: false,
-        error: 'Phone number not registered. Bind this SIM in NectaMail OTP Verifier first.'
+        error: 'Phone number not registered. Bind this SIM in Necta OTP Verifier first.'
       });
     }
 
@@ -253,16 +295,49 @@ app.post('/api/otp/verify', requireInternalSecret, async (req, res) => {
 });
 
 /**
- * 4. GET OTP INBOX & HISTORICAL IP AUDIT LOG
+ * 4. GET OTP INBOX & HISTORICAL IP AUDIT LOG (Hardware Keystore Signature Locked)
  */
 app.get('/api/otp/history/:phoneNumber', async (req, res) => {
   try {
     const phoneNumber = normalizePhone(req.params.phoneNumber);
+    const timestamp = req.headers['x-timestamp'];
+    const signature = req.headers['x-device-signature'];
+
+    if (!timestamp || !signature) {
+      return res.status(401).json({
+        success: false,
+        error: 'Missing hardware signature headers (x-timestamp, x-device-signature)'
+      });
+    }
+
+    const tsNum = Number(timestamp);
+    if (!Number.isFinite(tsNum) || Math.abs(Date.now() - tsNum) > 5 * 60 * 1000) {
+      return res.status(401).json({ success: false, error: 'Expired or invalid timestamp' });
+    }
+
     const deviceRef = db.collection('device_bindings').doc(phoneNumber);
     const deviceSnap = await deviceRef.get();
 
     if (!deviceSnap.exists) {
       return res.status(404).json({ success: false, error: 'Phone number not bound' });
+    }
+
+    const storedPublicKey = deviceSnap.data().publicKey;
+    if (!storedPublicKey) {
+      return res.status(403).json({ success: false, error: 'Device has no hardware public key registered' });
+    }
+
+    const isValid = verifyDeviceSignature(
+      storedPublicKey,
+      `HISTORY:${phoneNumber}:${timestamp}`,
+      signature
+    );
+
+    if (!isValid) {
+      return res.status(403).json({
+        success: false,
+        error: 'Hardware Keystore signature invalid. Unauthorized inbox access blocked.'
+      });
     }
 
     const historySnap = await deviceRef
