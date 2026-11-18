@@ -2,10 +2,12 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
-const admin = require('firebase-admin');
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
+const { getFirestore, FieldValue, Timestamp } = require('firebase-admin/firestore');
+const { getMessaging } = require('firebase-admin/messaging');
 
-// Initialize Firebase Admin safely across Vercel serverless invocations
-if (!admin.apps.length) {
+// Initialize Firebase Admin safely using v14 modular APIs
+if (!getApps().length) {
   let serviceAccount;
   if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
@@ -13,13 +15,13 @@ if (!admin.apps.length) {
     serviceAccount = require('./serviceAccountKey.json');
   }
 
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
+  initializeApp({
+    credential: cert(serviceAccount)
   });
 }
 
-const db = admin.firestore();
-const messaging = admin.messaging();
+const db = getFirestore();
+const messaging = getMessaging();
 
 const app = express();
 app.set('trust proxy', 1); // Extracts real client IP from Vercel's X-Forwarded-For header
@@ -84,11 +86,11 @@ app.post('/api/device/bind', async (req, res) => {
       publicKey: publicKey || null,
       deviceName: deviceName || 'Android Device',
       lastBoundIp: getClientIp(req),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      updatedAt: FieldValue.serverTimestamp()
     };
 
     if (!existing.exists) {
-      payload.boundAt = admin.firestore.FieldValue.serverTimestamp();
+      payload.boundAt = FieldValue.serverTimestamp();
     }
 
     await deviceRef.set(payload, { merge: true });
@@ -141,8 +143,8 @@ app.post('/api/otp/request', requireInternalSecret, async (req, res) => {
       userAgent,
       status: 'PENDING',
       attempts: 0,
-      createdAt: admin.firestore.Timestamp.fromMillis(now),
-      expiresAt: admin.firestore.Timestamp.fromMillis(expiresAt)
+      createdAt: Timestamp.fromMillis(now),
+      expiresAt: Timestamp.fromMillis(expiresAt)
     });
 
     let pushStatus = 'SKIPPED_TEST_TOKEN';
@@ -226,7 +228,7 @@ app.post('/api/otp/verify', requireInternalSecret, async (req, res) => {
 
     const submittedHash = hashOtp(String(otp).trim(), challengeId);
     if (submittedHash !== record.otpHash) {
-      await historyRef.update({ attempts: admin.firestore.FieldValue.increment(1) });
+      await historyRef.update({ attempts: FieldValue.increment(1) });
       return res.status(400).json({
         success: false,
         error: 'Invalid OTP',
@@ -236,7 +238,7 @@ app.post('/api/otp/verify', requireInternalSecret, async (req, res) => {
 
     await historyRef.update({
       status: 'VERIFIED',
-      verifiedAt: admin.firestore.FieldValue.serverTimestamp()
+      verifiedAt: FieldValue.serverTimestamp()
     });
 
     res.json({
